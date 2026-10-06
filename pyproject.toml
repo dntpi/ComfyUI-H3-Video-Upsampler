@@ -1,0 +1,13 @@
+[project]
+name = "comfyui-h3-video-upsampler"
+version = "0.1.0"
+description = "Upscale a finished MiniMax H3 clip: H3 latent upscaler + one light re-draw in tiles, with an h3upscale guide LoRA."
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/dntpi/ComfyUI-H3-Video-Upsampler"
+
+[tool.comfy]
+PublisherId = "sandpies"
+DisplayName = "H3 Video Upsampler"
