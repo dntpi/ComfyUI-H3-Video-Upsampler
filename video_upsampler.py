@@ -112,8 +112,9 @@ class HTCVideoUpsampler:
                     "tooltip": "Output size as area, aspect kept (1 MP = 1024 x 1024)."}),
                 "denoise": ("FLOAT", {
                     "default": 0.1, "min": 0.0, "max": 1.0, "step": 0.005,
-                    "tooltip": ("How hard the one re-draw step works. 0.1 is the setting that "
-                                "held (by eye, guided); 0 only enlarges.")}),
+                    "tooltip": ("Fraction of the schedule the two re-draw steps cover, as the "
+                                "chain's upsample_denoise. 0.1 is the setting that held; 0 only "
+                                "enlarges.")}),
                 "lora": (["None"] + folder_paths.get_filename_list("loras"), {
                     "default": "None",
                     "tooltip": ("A LoRA on the re-draw. An h3upscale LoRA (read off its header) "
@@ -140,8 +141,8 @@ class HTCVideoUpsampler:
     FUNCTION = "run"
     CATEGORY = "video/upscale"
     DESCRIPTION = (
-        "Upsamples a finished clip with the chain's upsampler: H3 latent upscale, then one "
-        "light re-draw in tiles. An h3upscale LoRA gets its guide in that same step. "
+        "Upsamples a finished clip with the chain's upsampler: H3 latent upscale, then a "
+        "light two-step re-draw in tiles. An h3upscale LoRA gets its guide in those steps. "
         "tile_tokens lets a smaller card cut more tiles.")
 
     def run(self, model, clip, vae, images, prompt, upscale_model, megapixels, denoise,
@@ -183,6 +184,13 @@ class HTCVideoUpsampler:
             clip=clip, prompt=str(prompt), width=w, height=h, length=length,
             ref_image_size="match")
         cond = (got.args if hasattr(got, "args") else tuple(got))[0]
+        try:
+            import comfy.model_management as _mm
+            if hasattr(clip, "patcher") and hasattr(clip.patcher, "model"):
+                clip.patcher.model.to(_mm.text_encoder_offload_device())
+                _mm.soft_empty_cache()
+        except Exception:
+            pass
 
         factor, guide = 0, None
         if str(lora) != "None" and float(lora_strength) != 0.0:
@@ -190,6 +198,14 @@ class HTCVideoUpsampler:
             factor = _ug.lora_factor(path)
             model = nodes.LoraLoaderModelOnly().load_lora_model_only(
                 model, str(lora), float(lora_strength))[0]
+        # As upsample_chain: port dense LoRA AdaLN patches (pruned DiTs).
+        fix = getattr(nodes, "NODE_CLASS_MAPPINGS", {}).get("H3AdaLNLoRAFix")
+        if fix is not None and hasattr(model, "patches"):
+            try:
+                res = fix.execute(model=model, mode="port")
+                model = (res.args if hasattr(res, "args") else tuple(res))[0]
+            except Exception:
+                pass
         if factor and float(denoise) > 0.0:
             _ug.install()
 
@@ -205,16 +221,20 @@ class HTCVideoUpsampler:
               f"tile budget {int(tile_tokens)} tokens"
               + (f"; guided by {lora} (factor {factor})" if guide is not None else
                  f"; re-draw LoRA {lora}" if str(lora) != "None" else ""), flush=True)
+        # The chain's re-draw, exactly as upsample_chain calls it.
+        steps = 2 if float(denoise) > 0.0 else _tu.STEPS
         out = _tu.upsample(model, cond, latent, sampler, str(upscale_model),
                            float(megapixels), float(denoise), guide=guide,
-                           budget=int(tile_tokens))
+                           budget=int(tile_tokens), steps=steps, start_sigma=0.0,
+                           overlap_px=192, detail_sigma=0.0)
         _tu._free(model)
         img = vae.decode(out["samples"].tensors[0])
         img = img.reshape(-1, img.shape[-3], img.shape[-2], img.shape[-1])[:n]
         report = (f"{n} frames {int(images.shape[2])}x{int(images.shape[1])} -> "
                   f"{int(img.shape[2])}x{int(img.shape[1])}"
                   + (f", guided ({lora})" if guide is not None else "")
-                  + f", denoise {float(denoise):g}, tile budget {int(tile_tokens)}")
+                  + f", {steps} step(s) at denoise {float(denoise):g}"
+                  + f", tile budget {int(tile_tokens)}, overlap 192px")
         print(f"[{TAG}] {report}", flush=True)
         return (img.float().cpu(), audio if audio is not None else silent_audio(n, H3_FPS),
                 report)

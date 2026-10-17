@@ -3,8 +3,8 @@
 > The LoRA and a mirror of this code: [Hugging Face](https://huggingface.co/sandpies/ComfyUI-H3-Video-Upsampler)
 
 Upscale a **finished** MiniMax H3 clip (or any clip) in ComfyUI: the H3 latent
-upscaler enlarges it, then one light re-draw step in tiles restores detail. With the
-**h3upscale x2 LoRA** that step also gets the clip itself, at half the output size,
+upscaler enlarges it, then a light two-step re-draw in tiles restores detail. With the
+**h3upscale x2 LoRA** those steps also get the clip itself, at half the output size,
 as a guide -- so it restores the clip's own detail instead of inventing texture.
 Mouths, motion and the soundtrack come from your clip.
 
@@ -25,7 +25,7 @@ video and audio VAE).
 | widget | what it does |
 |---|---|
 | `megapixels` | output size, aspect kept (2 = about 1920x1080) |
-| `denoise` | how hard the one re-draw step works; **0.1** is the tested setting, 0 only enlarges |
+| `denoise` | fraction of the schedule the two re-draw steps cover; **0.1** is the setting that held, 0 only enlarges |
 | `lora` | `h3upscale_v2_x2.safetensors` = guided re-draw (detected from its header). Any other LoRA just sits on the re-draw |
 | `tile_tokens` | **VRAM.** Largest sequence per tile; lower = more, smaller tiles, slower, less memory. 70000 is the default; try 40000 or 25000 on smaller cards |
 | `prompt` | defaults to the caption the LoRA was trained on; keep it with that LoRA |
@@ -40,7 +40,9 @@ video and audio VAE).
 ## What the LoRA does and does not do
 
 Tested by eye on H3 renders: guided at denoise 0.1, the 2 MP result beat the native
-render in a blind comparison. It is an **upscaler**: generating a video from noise
+render in a blind comparison (0.1.0, one step). 0.2.0 runs the re-draw exactly as
+Hand-Tie-Clips' chain upsampler does: two steps on the denoise schedule, 192 px
+tile overlap. It is an **upscaler**: generating a video from noise
 with it flickers every 17 frames (it was trained on 5-frame clips); refining an
 existing clip, as this node does, does not.
 

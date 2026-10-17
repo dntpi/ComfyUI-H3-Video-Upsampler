@@ -320,7 +320,12 @@ def _axis(size, tile, overlap, floor):
     return starts, extents, seams
 
 
-def tile_grid(h, w, tokens, factor=1, budget=TOKEN_BUDGET):
+def snap_overlap(px):
+    """Tile overlap in px, rounded to the 32 px patch grid, 0..512."""
+    return max(0, min(512, int(round(float(px) / 32.0)) * 32))
+
+
+def tile_grid(h, w, tokens, factor=1, budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX):
     """The tiles for an (h, w)-cell chunk of `tokens` video steps.
 
     -> list of (r0, c0, rows, cols, seam_top, seam_left, top, left, bottom,
@@ -328,7 +333,8 @@ def tile_grid(h, w, tokens, factor=1, budget=TOKEN_BUDGET):
     largest sequence one tile forward may carry: the recipe's TOKEN_BUDGET
     unless a caller lowers it to fit a smaller card.
     """
-    got = solve_grid(w * SPATIAL, h * SPATIAL, tokens, budget=int(budget), factor=factor)
+    got = solve_grid(w * SPATIAL, h * SPATIAL, tokens, overlap_px=snap_overlap(overlap_px),
+                     budget=int(budget), factor=factor)
     if got is None:
         raise RuntimeError(
             f"{TAG}: no tile grid up to {MAX_GRID_SIDE}x{MAX_GRID_SIDE} keeps "
@@ -711,20 +717,36 @@ def upscale_chunk(video, name, w_px, h_px):
 
 # --- sampling ---------------------------------------------------------------
 
-def recipe_sigmas(model, denoise=DENOISE):
+def recipe_sigmas(model, denoise=DENOISE, steps=STEPS, start_sigma=0.0):
     """One `simple` step at `denoise`, exactly as Core's BasicScheduler.
 
     The recipe's 0.2 is a fraction of the SCHEDULE, not of the noise: under
     H3's video shift (12) the step starts at sigma 0.75. Below it the re-draw
     repaints less; at 0 there is no re-draw and this returns None.
+
+    `start_sigma` > 0 (0.2.0) replaces `denoise`: the `simple` schedule over
+    the model's (shifted) sigmas, cut where it drops to `start_sigma`, then
+    `steps` steps spread evenly down that tail to 0. `steps` 1 with
+    `start_sigma` 0 is the 0.1.0 recipe exactly.
     """
     import comfy.samplers
+    steps = max(1, int(steps))
+    ms = model.get_model_object("model_sampling")
+    if float(start_sigma) > 0.0:
+        full = comfy.samplers.calculate_sigmas(ms, SCHEDULER, 1000).cpu().float()
+        tail = full[full <= float(start_sigma) + 1e-6]
+        if tail.numel() < 2:
+            return None
+        idx = torch.linspace(0, tail.numel() - 1, steps + 1).round().long()
+        idx = torch.unique_consecutive(idx)
+        sig = tail[idx]
+        sig[-1] = 0.0
+        return sig
     if float(denoise) <= 0.0:
         return None
-    total = int(STEPS / float(denoise))
-    sig = comfy.samplers.calculate_sigmas(
-        model.get_model_object("model_sampling"), SCHEDULER, total).cpu()
-    return sig[-(STEPS + 1):]
+    total = int(steps / float(denoise))
+    sig = comfy.samplers.calculate_sigmas(ms, SCHEDULER, total).cpu()
+    return sig[-(steps + 1):]
 
 
 def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed):
@@ -758,19 +780,57 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed):
     return out.to(mm.intermediate_device()).tensors[0]
 
 
+def _highpass_detail_merge(base_video, redrawn_video, sigma=8.0):
+    """Keep `base_video` (full-frame 3D latent upscaler output, zero tiles) for
+    tile-scale low frequencies (`> sigma` latent px, default 8.0 = 128 screen px)
+    and take all mid + fine structural and texture detail from `redrawn_video`
+    (tiled DiT re-draw): `base + (D - G_sigma(D))`.
+
+    Eliminates tile-to-tile low-frequency DC/colour/contrast grid seams while
+    preserving all mid-band facial/structural detail and fine texture from the
+    `h3upscale` LoRA.
+    """
+    sigma = float(sigma or 0.0)
+    if sigma <= 0.0 or base_video.shape != redrawn_video.shape or base_video.dim() < 5:
+        return redrawn_video
+    b, c, t, h, w = base_video.shape
+    base_f = base_video.to(device=redrawn_video.device, dtype=torch.float32)
+    red_f = redrawn_video.to(dtype=torch.float32)
+    d = red_f - base_f
+    radius = max(1, int(math.ceil(3.0 * sigma)))
+    rad_h = min(radius, max(0, h - 1))
+    rad_w = min(radius, max(0, w - 1))
+    low = d.reshape(b * c * t, 1, h, w)
+    if rad_w > 0:
+        cw = torch.arange(-rad_w, rad_w + 1, device=low.device, dtype=torch.float32)
+        kw = torch.exp(-0.5 * (cw / sigma) ** 2)
+        kw = (kw / kw.sum()).view(1, 1, 1, -1)
+        low = F.conv2d(F.pad(low, (rad_w, rad_w, 0, 0), mode="reflect"), kw)
+    if rad_h > 0:
+        ch = torch.arange(-rad_h, rad_h + 1, device=low.device, dtype=torch.float32)
+        kh = torch.exp(-0.5 * (ch / sigma) ** 2)
+        kh = (kh / kh.sum()).view(1, 1, -1, 1)
+        low = F.conv2d(F.pad(low, (0, 0, rad_h, rad_h), mode="reflect"), kh)
+    d_low = low.reshape(b, c, t, h, w)
+    return (base_f + (d - d_low)).to(dtype=redrawn_video.dtype)
+
+
 def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
-                 budget=TOKEN_BUDGET):
+                 budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
+                 detail_sigma=0.0):
     """Every tile stepped together, merged under the feather after each step.
 
     Step 0 hands each tile its slice of one noise field drawn at the chunk's
     full size; later steps add no noise. Audio rides along frozen. `factor`
     > 1 is a guided re-draw: tiles on the guide's grid, guide rows budgeted.
+    When `detail_sigma > 0`, applies `_highpass_detail_merge(video, x, detail_sigma)`
+    so low-frequency tile-grid shifts are stripped while fine detail is kept.
     """
     import comfy.nested_tensor as nt
     import comfy.sample
 
     _, _, t, h, w = video.shape
-    tiles, grid = tile_grid(h, w, t, factor, budget)
+    tiles, grid = tile_grid(h, w, t, factor, budget, overlap_px)
     field = comfy.sample.prepare_noise(nt.NestedTensor((video, audio)), seed)
     nv, na = field.tensors[0], field.tensors[1]
     dev, dt = video.device, video.dtype
@@ -785,8 +845,16 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     print(f"[{TAG}] chunk {w * SPATIAL}x{h * SPATIAL}px x {t} latent steps: "
           f"{grid[0]}x{grid[1]} tiles of {grid[2]}x{grid[3]}px, overlap "
           f"{grid[4]}/{grid[5]}px, {tokens} tokens per "
-          f"forward, stepped together", flush=True)
+          f"forward, stepped together"
+          + (f", high-pass detail={float(detail_sigma):g}" if float(detail_sigma or 0.0) > 0.0 else ""),
+          flush=True)
 
+    # Multi-step (0.2.0): every step runs over ALL tiles and is merged under
+    # the feather before the next step starts, so neighbours share one state
+    # at every sigma. Between steps x holds the sampler's output for a CONST
+    # (flow) model, i.e. x_t / (1 - sigma); the next call's zero-noise
+    # noise_scaling multiplies it back by (1 - sigma), so the hand-off is
+    # exact. Only step 0 draws noise, from one full-chunk field.
     x = video
     for step in range(len(sigmas) - 1):
         two = sigmas[step:step + 2]
@@ -803,6 +871,8 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                 ot.to(device=dev, dtype=torch.float32) * m
             wsum[:, :, :, r0:r0 + rows, c0:c0 + cols] += m[:, :, 0]
         x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
+    if float(detail_sigma or 0.0) > 0.0:
+        x = _highpass_detail_merge(video, x, sigma=float(detail_sigma))
     return x
 
 
@@ -853,7 +923,8 @@ def _free(model):
 
 
 def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
-             denoise=DENOISE, guide=None, budget=TOKEN_BUDGET):
+             denoise=DENOISE, guide=None, budget=TOKEN_BUDGET, steps=STEPS,
+             start_sigma=0.0, overlap_px=TILE_OVERLAP_PX, detail_sigma=0.0):
     """The whole recipe on an H3 AV latent. -> the upsampled AV latent dict.
 
     `conditioning` is one conditioning for the whole clip, or a callable
@@ -891,7 +962,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     else:
         w_px, h_px = target_size(video.shape[4] * SPATIAL, video.shape[3] * SPATIAL,
                                  megapixels)
-    sigmas = recipe_sigmas(model, denoise)
+    sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
     plan = chunks(tv)
     print(f"[{TAG}] {video.shape[4] * SPATIAL}x{video.shape[3] * SPATIAL} -> "
           f"{w_px}x{h_px} ({w_px * h_px / 1048576.0:.2f} MP), {len(plan)} "
@@ -932,7 +1003,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                                    f"needs {want} (steps, rows, cols)")
             ccond = add_guide(ccond, glat.to(cv.device, cv.dtype), factor)
             del glat
-        out_v = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, SEED, factor, budget)
+        out_v = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, SEED, factor, budget,
+                             overlap_px, detail_sigma=detail_sigma)
         done_v, done_a = join_chunk(done_v, done_a, out_v, ca, k0, f0)
     _free(model)
     return {"samples": nt.NestedTensor((done_v, done_a))}
@@ -988,9 +1060,18 @@ def stitch(seg):
             raise ValueError(f"hop {h['hop']}: its kept frames start at VAE "
                              f"phase {k % 5}, the joined latent is at "
                              f"{steps % 5}")
-        kept = v[:, :, k:]
+        # Hand-tie cuts the previous hop's tail instead of this hop's head.
+        tail = int(h.get("tail") or 0)
+        end = int(v.shape[2])
+        if tail:
+            end = tokens_to_reach(frames_in(end) - tail)
+            if frames_in(end) != frames_in(int(v.shape[2])) - tail:
+                raise ValueError(f"hop {h['hop']}: a tail cut of {tail} frames is "
+                                 "not a whole number of latent steps")
+        kept = v[:, :, k:end]
         vids.append(kept)
-        auds.append(a[..., round(drop * FRAME_RESCALE):])
+        auds.append(a[..., round(drop * FRAME_RESCALE):
+                      int(a.shape[-1]) - round(tail * FRAME_RESCALE)])
         steps += int(kept.shape[2])
     return torch.cat(vids, dim=2), torch.cat(auds, dim=-1)
 
@@ -1034,7 +1115,7 @@ def match_levels(frames, ref, chunk=16):
 
 def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
                    upscaler=UPSCALER_FILE, decode=None, denoise=DENOISE,
-                   alloc=None, guide=None):
+                   alloc=None, guide=None, budget=TOKEN_BUDGET):
     """The recipe over a finished chain. -> (IMAGE [N,H,W,3], note).
 
     `hops` are per-hop dicts: video/audio (the hop's delivered sampler
@@ -1059,13 +1140,31 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             return torch.empty((n, h, w, 3), dtype=torch.float32)
     if guide is not None and guide.decode is None:
         guide = guide._replace(decode=decode)
+    # Port any dense LoRA AdaLN patches onto a pruned `upsample_dit` if needed.
+    if model is not None and hasattr(model, "patches"):
+        try:
+            import nodes as _nodes_mod
+            _fix_cls = getattr(_nodes_mod, "NODE_CLASS_MAPPINGS", {}).get("H3AdaLNLoRAFix")
+            if _fix_cls is not None:
+                _res = _fix_cls.execute(model=model, mode="port")
+                model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
+        except Exception:
+            pass
+    # 2-step re-draw on the `upsample_denoise` schedule (`[0.5714, 0.3871, 0.0]`
+    # at `denoise=0.1`, `[0.7500, 0.5714, 0.0]` at `denoise=0.2` under H3's
+    # `shift=12` curve) + 192px raised-cosine tile overlap so an undistilled
+    # `upsample_dit` follows the curved trajectory cleanly while preserving 100%
+    # of `h3upscale`'s structural and fine-detail restoration.
+    _chain_steps = 2 if float(denoise) > 0.0 else STEPS
     want = sum(int(h["frames"]) for h in hops)
     frames, at, runs = None, 0, 0
     for seg in segments(hops):
         v, a = stitch(seg)
         lat = {"samples": nt.NestedTensor((v, a))}
         out = upsample(model, cond_by_frame(seg), lat, sampler, upscaler,
-                       megapixels, denoise, guide=guide)
+                       megapixels, denoise, guide=guide, budget=budget,
+                       steps=_chain_steps, start_sigma=0.0,
+                       overlap_px=192, detail_sigma=0.0)
         vid = out["samples"].tensors[0]
         _free(model)
         part = decode(vid).float().cpu()
