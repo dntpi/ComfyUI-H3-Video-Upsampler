@@ -770,6 +770,72 @@ def upscale_chunk(video, name, w_px, h_px):
             torch.cuda.empty_cache()
 
 
+def upscale_chunks_batch(videos, name, w_px, h_px):
+    """Upscale a list of chunk video latents `[cv_0, cv_1, ...]` in one pass so
+    the 345M-parameter 3D Conv upscaler is loaded onto GPU once instead of 21
+    times across a 10-hop chain."""
+    if not videos:
+        return []
+    _, _, _t0, h_in, w_in = videos[0].shape
+    scale = (w_px / (w_in * SPATIAL) + h_px / (h_in * SPATIAL)) / 2.0
+    h_out = max(1, int(round(h_px / SPATIAL)))
+    w_out = max(1, int(round(w_px / SPATIAL)))
+    if scale < 1.0 and (w_out < w_in or h_out < h_in):
+        raise RuntimeError(f"{TAG}: {w_px}x{h_px} is smaller than the clip "
+                           f"({w_in * SPATIAL}x{h_in * SPATIAL}); this only "
+                           "upscales. Raise megapixels.")
+    if (h_out, w_out) == (h_in, w_in):
+        return list(videos)
+    # If a test monkeypatches `upscale_chunk`, honour the monkeypatch per chunk.
+    if upscale_chunk is not _DEFAULT_UPSCALE_CHUNK:
+        return [upscale_chunk(v, name, w_px, h_px) for v in videos]
+    dev = _device()
+    if dev.type == "cuda":
+        _free_all_gpu()
+    net = load_upscaler(name)
+    out_list = []
+    try:
+        net = net.to(device=dev, dtype=UPSCALER_DTYPE)
+        mean = torch.tensor(LATENT_MEAN, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
+        std = torch.tensor(LATENT_STD, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
+        for v in videos:
+            t = int(v.shape[2])
+            try:
+                with torch.inference_mode():
+                    x = (v.to(device=dev, dtype=UPSCALER_DTYPE, copy=True) - mean) / std
+                    o = net(x, (t, h_out, w_out), scale)
+                    del x
+                    o = o * std + mean
+                out_list.append(o.to(device="cpu", dtype=v.dtype))
+                del o
+            except Exception as exc:
+                if dev.type != "cuda" or not _is_oom(exc):
+                    raise
+                print(f"[{TAG}] CUDA VRAM tight during 3D latent upscale ({exc}); "
+                      "sharing load with CPU...", flush=True)
+                net.to("cpu")
+                torch.cuda.empty_cache()
+                dev = torch.device("cpu")
+                net = net.to(device=dev, dtype=torch.float32)
+                mean = torch.tensor(LATENT_MEAN, device=dev, dtype=torch.float32).view(1, -1, 1, 1, 1)
+                std = torch.tensor(LATENT_STD, device=dev, dtype=torch.float32).view(1, -1, 1, 1, 1)
+                with torch.inference_mode():
+                    x = (v.to(device=dev, dtype=torch.float32, copy=True) - mean) / std
+                    o = net(x, (t, h_out, w_out), scale)
+                    del x
+                    o = o * std + mean
+                out_list.append(o.to(device="cpu", dtype=v.dtype))
+                del o
+    finally:
+        net.to(device="cpu", dtype=UPSCALER_DTYPE)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return out_list
+
+
+_DEFAULT_UPSCALE_CHUNK = upscale_chunk
+
+
 # --- sampling ---------------------------------------------------------------
 
 def recipe_sigmas(model, denoise=DENOISE, steps=STEPS, start_sigma=0.0):
@@ -860,6 +926,7 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed):
                         seed=seed)
     res = out.to(mm.intermediate_device()).tensors[0]
     del out, guider, samples, mask
+    mm.soft_empty_cache()
     return res
 
 
@@ -969,23 +1036,35 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
         # exact. Only step 0 draws noise, from one full-chunk field.
         try:
             x = video
-            for step in range(len(sigmas) - 1):
-                two = sigmas[step:step + 2]
-                acc = torch.zeros_like(x, dtype=torch.float32)
-                wsum = torch.zeros((1, 1, 1, h, w), device=dev, dtype=torch.float32)
-                for r0, c0, rows, cols, tcond, m in prepared:
-                    xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
-                    if step == 0:
-                        noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
-                    else:
-                        noise = (torch.zeros_like(xt), torch.zeros_like(audio))
-                    ot = sample_tile(model, tcond, sampler, two, xt, audio, noise, seed)
-                    acc[:, :, :, r0:r0 + rows, c0:c0 + cols] += \
-                        ot.to(device=dev, dtype=torch.float32) * m
-                    wsum[:, :, :, r0:r0 + rows, c0:c0 + cols] += m[:, :, 0]
-                    del ot, xt
-                x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
-                del acc, wsum
+            if len(prepared) == 1:
+                # 1x1 whole-chunk tile: no spatial tile seams to feather-merge
+                # between steps, so run all `sigmas` in a single `sample_tile`
+                # (`CFGGuider.sample`) call instead of re-staging the 32.4 GB
+                # DynamicVRAM DiT on every step.
+                r0, c0, rows, cols, tcond, _m = prepared[0]
+                xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
+                noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
+                ot = sample_tile(model, tcond, sampler, sigmas, xt, audio, noise, seed)
+                x = ot.to(device=dev, dtype=dt)
+                del ot, xt
+            else:
+                for step in range(len(sigmas) - 1):
+                    two = sigmas[step:step + 2]
+                    acc = torch.zeros_like(x, dtype=torch.float32)
+                    wsum = torch.zeros((1, 1, 1, h, w), device=dev, dtype=torch.float32)
+                    for r0, c0, rows, cols, tcond, m in prepared:
+                        xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
+                        if step == 0:
+                            noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
+                        else:
+                            noise = (torch.zeros_like(xt), torch.zeros_like(audio))
+                        ot = sample_tile(model, tcond, sampler, two, xt, audio, noise, seed)
+                        acc[:, :, :, r0:r0 + rows, c0:c0 + cols] += \
+                            ot.to(device=dev, dtype=torch.float32) * m
+                        wsum[:, :, :, r0:r0 + rows, c0:c0 + cols] += m[:, :, 0]
+                        del ot, xt
+                    x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
+                    del acc, wsum
             break
         except Exception as exc:
             if not _is_oom(exc) or cur_budget <= 16384:
@@ -1101,24 +1180,38 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
           + (f", h3upscale guide at {w_px // factor}x{h_px // factor}"
              if guide is not None and sigmas is not None else ""), flush=True)
 
+    # 3-Phase non-overlapping execution so VideoVAE, 3D LatentUpscaler, and the
+    # 32.4 GB DynamicVRAM H3 DiT never coexist or churn in and out of VRAM
+    # across 21 chunks:
+    #   Phase 1: Decode & encode all `h3upscale` guide latents on VideoVAE once,
+    #            store on CPU RAM (~1.5 MB/chunk), then unload VideoVAE.
+    #   Phase 2: Load 3D `LatentUpscaler` onto GPU once, upscale all chunk video
+    #            latents, store on CPU RAM (~6 MB/chunk), then offload upscaler.
+    #   Phase 3: Stage the 32.4 GB H3 DiT onto GPU ONCE and step all chunks
+    #            without unloading/re-staging the DiT between chunks.
+    if _device().type == "cuda":
+        _free(model)
+    raw_cvs = [video[:, :, k0:k1].contiguous() for (k0, _f0, k1, _f1) in plan]
+    glats = [None] * len(plan)
+    if guide is not None and sigmas is not None:
+        for i, cv_in in enumerate(raw_cvs):
+            px = guide.decode(cv_in)[:frames_in(cv_in.shape[2])]
+            glat = encode_steps(guide.encode, guide.pixels(px, w_px, h_px, factor),
+                                int(cv_in.shape[2]))
+            glats[i] = glat.cpu() if hasattr(glat, "cpu") else glat
+            del px, glat
+        if _device().type == "cuda":
+            _free_all_gpu()
+
+    upscaled_cvs = upscale_chunks_batch(raw_cvs, upscaler, w_px, h_px)
+    del raw_cvs
+
     done_v = done_a = None
     for i, (k0, f0, k1, f1) in enumerate(plan):
         a0, a1 = audio_span(f0, f1)
-        cv = video[:, :, k0:k1].contiguous()
+        cv = upscaled_cvs[i]
+        upscaled_cvs[i] = None
         ca = audio[:, :, :, a0:min(a1, ta)].contiguous()
-        if _device().type == "cuda":
-            _free(model)            # never H3 and the upscaler resident at once
-        glat = None
-        if guide is not None and sigmas is not None:
-            # From this chunk's own canvas frames, before the upscaler runs:
-            # the guide is what the film IS, the enlarged latent is a guess.
-            px = guide.decode(cv)[:frames_in(cv.shape[2])]
-            glat = encode_steps(guide.encode, guide.pixels(px, w_px, h_px, factor),
-                                int(cv.shape[2]))
-            del px
-            if _device().type == "cuda":
-                _free_all_gpu()
-        cv = upscale_chunk(cv, upscaler, w_px, h_px)
         if sigmas is None:
             done_v, done_a = join_chunk(done_v, done_a, cv, ca, k0, f0)
             continue
@@ -1126,6 +1219,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
                                else cond, f0, f1, cv.shape[3], cv.shape[4])
         if i > 0:
             ccond = pin_chunk_start(ccond, done_v, f0)
+        glat = glats[i]
+        glats[i] = None
         if glat is not None:
             want = (int(cv.shape[2]), int(cv.shape[3]) // factor, int(cv.shape[4]) // factor)
             got = tuple(int(x) for x in glat.shape[2:])
@@ -1137,6 +1232,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
         out_v = redraw_chunk(model, ccond, sampler, sigmas, cv, ca, SEED, factor, budget,
                              overlap_px, detail_sigma=detail_sigma)
         done_v, done_a = join_chunk(done_v, done_a, out_v, ca, k0, f0)
+        del cv, out_v
     _free(model)
     return {"samples": nt.NestedTensor((done_v, done_a))}
 
