@@ -34,6 +34,12 @@ video and audio VAE).
   trained on the bare DiT, and extra LoRAs under it re-add their own texture.
 - `audio_vae` wired: the re-draw hears the soundtrack (best at 24 fps). Unwired:
   it hears silence. Either way you get your original soundtrack back.
+- **Low VRAM / RAM:** with [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes)
+  installed, the re-draw model gets its MiniMax low-VRAM attention and chunked
+  feed-forward (same maths, less memory); without it they are skipped. Other
+  models are unloaded before each stage, the latent upscale falls back to CPU and
+  the re-draw to smaller tiles if the card runs out, and the result is decoded
+  in slices so a long clip never sits in RAM as one tensor.
 - Any frame size and length: frames are fitted to 32 px and padded to a valid H3
   length, then the padding is trimmed off again.
 

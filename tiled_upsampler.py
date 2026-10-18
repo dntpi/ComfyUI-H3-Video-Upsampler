@@ -682,11 +682,42 @@ def _device():
     return mm.get_torch_device()
 
 
+def _free_all_gpu():
+    """Unload any resident ComfyUI models (VAE, CLIP, DiT) and empty CUDA cache."""
+    try:
+        import gc
+        import comfy.model_management as mm
+        mm.unload_all_models()
+        gc.collect()
+        mm.soft_empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _is_oom(exc):
+    """True when `exc` is a CUDA or ComfyUI out-of-memory error."""
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    try:
+        import comfy.model_management as mm
+        if isinstance(exc, getattr(mm, "OOM_EXCEPTION", ())):
+            return True
+    except Exception:
+        pass
+    msg = str(exc).lower()
+    return "out of memory" in msg or "cuda error: out of memory" in msg or "alloc" in msg
+
+
 def upscale_chunk(video, name, w_px, h_px):
     """One chunk's video latent resized to (w_px, h_px) by the upscaler.
 
     The network is told the scale actually achieved (mean of the two axes),
     and runs in fp16 end to end, normalisation included, as in the recipe.
+    Unloads resident ComfyUI models before moving the 512-channel 3D Conv
+    upscaler to CUDA, and automatically falls back to CPU (float32) if CUDA
+    VRAM is exhausted so the latent upscale stage can never OOM.
     """
     _, _, t, h_in, w_in = video.shape
     scale = (w_px / (w_in * SPATIAL) + h_px / (h_in * SPATIAL)) / 2.0
@@ -699,20 +730,44 @@ def upscale_chunk(video, name, w_px, h_px):
     if (h_out, w_out) == (h_in, w_in):
         return video
     dev = _device()
-    net = load_upscaler(name).to(dev)
-    mean = torch.tensor(LATENT_MEAN, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
-    std = torch.tensor(LATENT_STD, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
+    if dev.type == "cuda":
+        _free_all_gpu()
+    net = load_upscaler(name)
     try:
+        net = net.to(device=dev, dtype=UPSCALER_DTYPE)
+        mean = torch.tensor(LATENT_MEAN, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
+        std = torch.tensor(LATENT_STD, device=dev, dtype=UPSCALER_DTYPE).view(1, -1, 1, 1, 1)
         with torch.inference_mode():
             x = (video.to(device=dev, dtype=UPSCALER_DTYPE, copy=True) - mean) / std
             out = net(x, (t, h_out, w_out), scale)
             del x
             out = out * std + mean
+        return out.to(device="cpu", dtype=video.dtype)
+    except Exception as exc:
+        if dev.type != "cuda" or not _is_oom(exc):
+            raise
+        print(f"[{TAG}] CUDA VRAM tight during 3D latent upscale ({exc}); "
+              "sharing load with CPU...", flush=True)
+        try:
+            net.to("cpu")
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        cpu_dev = torch.device("cpu")
+        net = net.to(device=cpu_dev, dtype=torch.float32)
+        mean = torch.tensor(LATENT_MEAN, device=cpu_dev, dtype=torch.float32).view(1, -1, 1, 1, 1)
+        std = torch.tensor(LATENT_STD, device=cpu_dev, dtype=torch.float32).view(1, -1, 1, 1, 1)
+        with torch.inference_mode():
+            x = (video.to(device=cpu_dev, dtype=torch.float32, copy=True) - mean) / std
+            out = net(x, (t, h_out, w_out), scale)
+            del x
+            out = out * std + mean
+        net.to(dtype=UPSCALER_DTYPE)
+        return out.to(device="cpu", dtype=video.dtype)
     finally:
         net.to("cpu")
         if dev.type == "cuda":
             torch.cuda.empty_cache()
-    return out.to(device="cpu", dtype=video.dtype)
 
 
 # --- sampling ---------------------------------------------------------------
@@ -749,6 +804,32 @@ def recipe_sigmas(model, denoise=DENOISE, steps=STEPS, start_sigma=0.0):
     return sig[-(steps + 1):]
 
 
+def _apply_low_vram_patches(model):
+    """Apply AdaLN port, 4-way attention head chunking, and 2-way SwiGLU FFN
+    token chunking (as in Seanaiochat.json's MiniMaxLowVRAMAttention(4) +
+    MiniMaxChunkFeedForward(2, 4096)) onto `model` so tiled upsampling uses
+    minimal activation VRAM even when `upsample_dit` is wired from a bare
+    UNETLoader. Mathematically identical to the unchunked forward."""
+    if model is None or not hasattr(model, "get_model_object"):
+        return model
+    try:
+        import nodes as _nodes_mod
+        nmap = getattr(_nodes_mod, "NODE_CLASS_MAPPINGS", {}) or {}
+        if hasattr(model, "patches") and "H3AdaLNLoRAFix" in nmap:
+            _res = nmap["H3AdaLNLoRAFix"].execute(model=model, mode="port")
+            model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
+        if "MiniMaxLowVRAMAttention" in nmap:
+            _res = nmap["MiniMaxLowVRAMAttention"].execute(model=model, head_chunks=4)
+            model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
+        if "MiniMaxChunkFeedForward" in nmap:
+            _res = nmap["MiniMaxChunkFeedForward"].execute(
+                model=model, chunks=2, seq_threshold=4096)
+            model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
+    except Exception:
+        pass
+    return model
+
+
 def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed):
     """One tile through `sigmas`, audio frozen. -> the tile's video latent.
 
@@ -777,7 +858,9 @@ def sample_tile(model, cond, sampler, sigmas, video, audio, noise, seed):
                         denoise_mask=mask, callback=callback,
                         disable_pbar=not comfy.utils.PROGRESS_BAR_ENABLED,
                         seed=seed)
-    return out.to(mm.intermediate_device()).tensors[0]
+    res = out.to(mm.intermediate_device()).tensors[0]
+    del out, guider, samples, mask
+    return res
 
 
 def _highpass_detail_merge(base_video, redrawn_video, sigma=8.0):
@@ -815,6 +898,29 @@ def _highpass_detail_merge(base_video, redrawn_video, sigma=8.0):
     return (base_f + (d - d_low)).to(dtype=redrawn_video.dtype)
 
 
+def _cond_extra_tokens(cond):
+    """Extra non-strided conditioning rows (`minimax_refs` + `minimax_keyframes`)
+    that ride every tile forward alongside the tile's own video tokens."""
+    if not cond:
+        return 0
+    extra = 0
+    try:
+        d = cond[0][1] if len(cond[0]) > 1 and isinstance(cond[0][1], dict) else {}
+        for blk in (d.get("minimax_refs") or ()):
+            kind = blk.get("kind")
+            if kind == "image":
+                extra += max(0, int(blk.get("latent_h", 0)) // 2) * max(0, int(blk.get("latent_w", 0)) // 2)
+            elif kind in ("video", "video_audio"):
+                extra += (max(0, int(blk.get("latent_t", 0)))
+                          * max(0, int(blk.get("latent_h", 0)) // 2)
+                          * max(0, int(blk.get("latent_w", 0)) // 2))
+            if kind in ("audio", "video_audio"):
+                extra += max(0, int(blk.get("ref_audio_t", 0))) * 2
+    except Exception:
+        return 0
+    return extra
+
+
 def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
                  budget=TOKEN_BUDGET, overlap_px=TILE_OVERLAP_PX,
                  detail_sigma=0.0):
@@ -825,52 +931,74 @@ def redraw_chunk(model, cond, sampler, sigmas, video, audio, seed, factor=1,
     > 1 is a guided re-draw: tiles on the guide's grid, guide rows budgeted.
     When `detail_sigma > 0`, applies `_highpass_detail_merge(video, x, detail_sigma)`
     so low-frequency tile-grid shifts are stripped while fine detail is kept.
+    Includes an automatic OOM guardrail: if a tile forward runs out of VRAM at
+    `budget`, halves the tile token budget to split into smaller tiles and
+    retries the chunk automatically.
     """
     import comfy.nested_tensor as nt
     import comfy.sample
 
     _, _, t, h, w = video.shape
-    tiles, grid = tile_grid(h, w, t, factor, budget, overlap_px)
     field = comfy.sample.prepare_noise(nt.NestedTensor((video, audio)), seed)
     nv, na = field.tensors[0], field.tensors[1]
     dev, dt = video.device, video.dtype
-    prepared = []
-    for (r0, c0, rows, cols, st, sl, top, left, bottom, right) in tiles:
-        prepared.append((r0, c0, rows, cols,
-                         cond_for_tile(cond, h, w, r0, c0, rows, cols),
-                         feather(rows, cols, st, sl, top, left, bottom, right,
-                                 dev)[None, None, None]))
-    tokens = (seq_len(grid[2], grid[3], t) if int(factor) <= 1
-              else f"{guided_seq_len(grid[2], grid[3], t, factor)} (guide incl.)")
-    print(f"[{TAG}] chunk {w * SPATIAL}x{h * SPATIAL}px x {t} latent steps: "
-          f"{grid[0]}x{grid[1]} tiles of {grid[2]}x{grid[3]}px, overlap "
-          f"{grid[4]}/{grid[5]}px, {tokens} tokens per "
-          f"forward, stepped together"
-          + (f", high-pass detail={float(detail_sigma):g}" if float(detail_sigma or 0.0) > 0.0 else ""),
-          flush=True)
+    cur_budget = int(budget)
 
-    # Multi-step (0.2.0): every step runs over ALL tiles and is merged under
-    # the feather before the next step starts, so neighbours share one state
-    # at every sigma. Between steps x holds the sampler's output for a CONST
-    # (flow) model, i.e. x_t / (1 - sigma); the next call's zero-noise
-    # noise_scaling multiplies it back by (1 - sigma), so the hand-off is
-    # exact. Only step 0 draws noise, from one full-chunk field.
-    x = video
-    for step in range(len(sigmas) - 1):
-        two = sigmas[step:step + 2]
-        acc = torch.zeros_like(x, dtype=torch.float32)
-        wsum = torch.zeros((1, 1, 1, h, w), device=dev, dtype=torch.float32)
-        for r0, c0, rows, cols, tcond, m in prepared:
-            xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
-            if step == 0:
-                noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
-            else:
-                noise = (torch.zeros_like(xt), torch.zeros_like(audio))
-            ot = sample_tile(model, tcond, sampler, two, xt, audio, noise, seed)
-            acc[:, :, :, r0:r0 + rows, c0:c0 + cols] += \
-                ot.to(device=dev, dtype=torch.float32) * m
-            wsum[:, :, :, r0:r0 + rows, c0:c0 + cols] += m[:, :, 0]
-        x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
+    while True:
+        tiles, grid = tile_grid(h, w, t, factor, cur_budget, overlap_px)
+        prepared = []
+        for (r0, c0, rows, cols, st, sl, top, left, bottom, right) in tiles:
+            prepared.append((r0, c0, rows, cols,
+                             cond_for_tile(cond, h, w, r0, c0, rows, cols),
+                             feather(rows, cols, st, sl, top, left, bottom, right,
+                                     dev)[None, None, None]))
+        tokens = (seq_len(grid[2], grid[3], t) if int(factor) <= 1
+                  else f"{guided_seq_len(grid[2], grid[3], t, factor)} (guide incl.)")
+        print(f"[{TAG}] chunk {w * SPATIAL}x{h * SPATIAL}px x {t} latent steps: "
+              f"{grid[0]}x{grid[1]} tiles of {grid[2]}x{grid[3]}px, overlap "
+              f"{grid[4]}/{grid[5]}px, {tokens} tokens per "
+              f"forward, stepped together"
+              + (f", high-pass detail={float(detail_sigma):g}" if float(detail_sigma or 0.0) > 0.0 else ""),
+              flush=True)
+
+        # Multi-step (0.2.0): every step runs over ALL tiles and is merged under
+        # the feather before the next step starts, so neighbours share one state
+        # at every sigma. Between steps x holds the sampler's output for a CONST
+        # (flow) model, i.e. x_t / (1 - sigma); the next call's zero-noise
+        # noise_scaling multiplies it back by (1 - sigma), so the hand-off is
+        # exact. Only step 0 draws noise, from one full-chunk field.
+        try:
+            x = video
+            for step in range(len(sigmas) - 1):
+                two = sigmas[step:step + 2]
+                acc = torch.zeros_like(x, dtype=torch.float32)
+                wsum = torch.zeros((1, 1, 1, h, w), device=dev, dtype=torch.float32)
+                for r0, c0, rows, cols, tcond, m in prepared:
+                    xt = x[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous()
+                    if step == 0:
+                        noise = (nv[:, :, :, r0:r0 + rows, c0:c0 + cols].contiguous(), na)
+                    else:
+                        noise = (torch.zeros_like(xt), torch.zeros_like(audio))
+                    ot = sample_tile(model, tcond, sampler, two, xt, audio, noise, seed)
+                    acc[:, :, :, r0:r0 + rows, c0:c0 + cols] += \
+                        ot.to(device=dev, dtype=torch.float32) * m
+                    wsum[:, :, :, r0:r0 + rows, c0:c0 + cols] += m[:, :, 0]
+                    del ot, xt
+                x = (acc / wsum.clamp(min=1e-8)).to(dtype=dt)
+                del acc, wsum
+            break
+        except Exception as exc:
+            if not _is_oom(exc) or cur_budget <= 16384:
+                raise
+            next_budget = max(16384, int(cur_budget * 0.65))
+            if next_budget >= cur_budget:
+                raise
+            print(f"[{TAG}] CUDA OOM at tile budget {cur_budget} ({exc}); "
+                  f"lowering tile budget to {next_budget} (more, smaller tiles) and retrying chunk...",
+                  flush=True)
+            _free_all_gpu()
+            cur_budget = next_budget
+
     if float(detail_sigma or 0.0) > 0.0:
         x = _highpass_detail_merge(video, x, sigma=float(detail_sigma))
     return x
@@ -962,6 +1090,7 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
     else:
         w_px, h_px = target_size(video.shape[4] * SPATIAL, video.shape[3] * SPATIAL,
                                  megapixels)
+    model = _apply_low_vram_patches(model)
     sigmas = recipe_sigmas(model, denoise, steps, start_sigma)
     plan = chunks(tv)
     print(f"[{TAG}] {video.shape[4] * SPATIAL}x{video.shape[3] * SPATIAL} -> "
@@ -987,6 +1116,8 @@ def upsample(model, conditioning, latent, sampler, upscaler, megapixels,
             glat = encode_steps(guide.encode, guide.pixels(px, w_px, h_px, factor),
                                 int(cv.shape[2]))
             del px
+            if _device().type == "cuda":
+                _free_all_gpu()
         cv = upscale_chunk(cv, upscaler, w_px, h_px)
         if sigmas is None:
             done_v, done_a = join_chunk(done_v, done_a, cv, ca, k0, f0)
@@ -1093,7 +1224,7 @@ def cond_by_frame(seg):
     return pick
 
 
-def match_levels(frames, ref, chunk=16):
+def match_levels(frames, ref, chunk=16, in_place=False):
     """Each upsampled frame's per-channel mean moved onto the matching frame
     of `ref` (the chain's tone-corrected master at the canvas size), clamped
     to 0..1.
@@ -1104,7 +1235,7 @@ def match_levels(frames, ref, chunk=16):
     over -- and also takes back any level the light re-draw moved. It is not
     a contrast match: lut / gain_bias slopes are not reproduced.
     """
-    out = torch.empty_like(frames)
+    out = frames if in_place else torch.empty_like(frames)
     for s in range(0, int(frames.shape[0]), chunk):
         up = frames[s:s + chunk].float()
         rf = ref[s:s + chunk].float()
@@ -1140,16 +1271,7 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
             return torch.empty((n, h, w, 3), dtype=torch.float32)
     if guide is not None and guide.decode is None:
         guide = guide._replace(decode=decode)
-    # Port any dense LoRA AdaLN patches onto a pruned `upsample_dit` if needed.
-    if model is not None and hasattr(model, "patches"):
-        try:
-            import nodes as _nodes_mod
-            _fix_cls = getattr(_nodes_mod, "NODE_CLASS_MAPPINGS", {}).get("H3AdaLNLoRAFix")
-            if _fix_cls is not None:
-                _res = _fix_cls.execute(model=model, mode="port")
-                model = (_res.args if hasattr(_res, "args") else tuple(_res))[0]
-        except Exception:
-            pass
+    model = _apply_low_vram_patches(model)
     # 2-step re-draw on the `upsample_denoise` schedule (`[0.5714, 0.3871, 0.0]`
     # at `denoise=0.1`, `[0.7500, 0.5714, 0.0]` at `denoise=0.2` under H3's
     # `shift=12` curve) + 192px raised-cosine tile overlap so an undistilled
@@ -1167,19 +1289,51 @@ def upsample_chain(model, sampler, vae, hops, megapixels, master=None,
                        overlap_px=192, detail_sigma=0.0)
         vid = out["samples"].tensors[0]
         _free(model)
-        part = decode(vid).float().cpu()
-        del out, vid
-        n = int(part.shape[0])
-        if at + n > want:
-            raise ValueError(f"the upsampled film is at least {at + n} frames, "
-                             f"the chain delivered {want}")
-        if frames is None:
-            frames = alloc(want, int(part.shape[1]), int(part.shape[2]))
-        if master is not None:
-            part = match_levels(part, master[at:at + n])
-        frames[at:at + n] = part.to(frames.dtype)
-        del part
-        at += n
+        if _device().type == "cuda":
+            _free_all_gpu()
+        tv_seg = int(vid.shape[2])
+        if vae is not None and tv_seg > 32:
+            # Stream-decode in 30-token (102-frame) windows with a 5-token (17-frame)
+            # causal warm-up prefix so ViT3DDecoder never allocates a full-film
+            # 22-44 GB float32 tensor in RAM at once, writing each slice directly
+            # into the disk-backed `frames` memmap.
+            del out
+            for k0 in range(0, tv_seg, 30):
+                k1 = min(tv_seg, k0 + 30)
+                k_in_start = max(0, k0 - 5) if k0 > 0 else 0
+                k_in_end = min(tv_seg, k1 + 2) if k1 < tv_seg else tv_seg
+                sub_z = vid[:, :, k_in_start:k_in_end].contiguous()
+                part = decode(sub_z).float().cpu()
+                del sub_z
+                drop_head = 17 if k0 > 0 else 0
+                keep_len = frames_in(k1) - frames_in(k0)
+                part = part[drop_head:drop_head + keep_len]
+                n = int(part.shape[0])
+                if at + n > want:
+                    raise ValueError(f"the upsampled film is at least {at + n} frames, "
+                                     f"the chain delivered {want}")
+                if frames is None:
+                    frames = alloc(want, int(part.shape[1]), int(part.shape[2]))
+                if master is not None:
+                    part = match_levels(part, master[at:at + n], in_place=True)
+                frames[at:at + n] = part.to(frames.dtype)
+                del part
+                at += n
+            del vid
+        else:
+            part = decode(vid).float().cpu()
+            del out, vid
+            n = int(part.shape[0])
+            if at + n > want:
+                raise ValueError(f"the upsampled film is at least {at + n} frames, "
+                                 f"the chain delivered {want}")
+            if frames is None:
+                frames = alloc(want, int(part.shape[1]), int(part.shape[2]))
+            if master is not None:
+                part = match_levels(part, master[at:at + n], in_place=True)
+            frames[at:at + n] = part.to(frames.dtype)
+            del part
+            at += n
         runs += 1
     if at != want:
         raise ValueError(f"the upsampled film is {at} frames, "

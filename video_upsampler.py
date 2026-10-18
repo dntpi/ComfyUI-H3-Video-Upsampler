@@ -84,6 +84,33 @@ def silent_audio(n_frames, fps, sample_rate=44100):
             "sample_rate": sample_rate}
 
 
+def decode_streamed(decode, vid, n, slice_t=30, warm_t=5, tail_t=2):
+    """The first `n` frames of `vid`, decoded as upsample_chain decodes: 30-token
+    slices, each opened on a 5-token (17-frame) warm-up it then drops and read
+    2 tokens past its end, so the full clip is never one tensor in RAM."""
+    tv = int(vid.shape[2])
+    if tv <= slice_t + warm_t:
+        img = decode(vid).float().cpu()
+        return img.reshape(-1, img.shape[-3], img.shape[-2], img.shape[-1])[:n]
+    out, at = None, 0
+    for k0 in range(0, tv, slice_t):
+        k1 = min(tv, k0 + slice_t)
+        a = max(0, k0 - warm_t)
+        b = min(tv, k1 + tail_t)
+        part = decode(vid[:, :, a:b].contiguous()).float().cpu()
+        part = part.reshape(-1, part.shape[-3], part.shape[-2], part.shape[-1])
+        head = _tu.frames_in(k0) - _tu.frames_in(a)
+        keep = min(_tu.frames_in(k1) - _tu.frames_in(k0), n - at)
+        if keep <= 0:
+            break
+        if out is None:
+            out = torch.empty((n, int(part.shape[1]), int(part.shape[2]), 3), dtype=torch.float32)
+        out[at:at + keep] = part[head:head + keep]
+        at += keep
+        del part
+    return out[:at]
+
+
 class HTCVideoUpsampler:
     """A finished H3 (or any) clip upsampled with the chain's upsampler."""
 
@@ -228,8 +255,10 @@ class HTCVideoUpsampler:
                            budget=int(tile_tokens), steps=steps, start_sigma=0.0,
                            overlap_px=192, detail_sigma=0.0)
         _tu._free(model)
-        img = vae.decode(out["samples"].tensors[0])
-        img = img.reshape(-1, img.shape[-3], img.shape[-2], img.shape[-1])[:n]
+        if _tu._device().type == "cuda":
+            _tu._free_all_gpu()
+        img = decode_streamed(vae.decode, out["samples"].tensors[0], n)
+        del out
         report = (f"{n} frames {int(images.shape[2])}x{int(images.shape[1])} -> "
                   f"{int(img.shape[2])}x{int(img.shape[1])}"
                   + (f", guided ({lora})" if guide is not None else "")
